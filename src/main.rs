@@ -85,7 +85,10 @@ impl BraavosAccumulator {
     }
 
     fn delete(&mut self, x: &[u8]) -> Result<(), &'static str> {
+        // Step 1: Check that x is an odd prime (already done in get_or_generate_element)
         let elem = self.get_or_generate_element(x);
+        
+        // Step 2: Let a = a^(x^-1 mod sk)
         let elem_inv = if elem.inv_mod(&self.sk).is_some().into() {
             elem.inv_mod(&self.sk).unwrap()
         } else {
@@ -93,6 +96,8 @@ impl BraavosAccumulator {
         };
         let elem_inv_512 = pad_u256_to_u512(elem_inv);
         let new_a = self.mont_mod_exp(self.a, &elem_inv_512);
+        
+        // Step 3 & 4: Update accumulator and return
         self.a = MontyForm::new(&(new_a.retrieve() % *self.n.as_ref()), self.monty_params);
         Ok(())
     }
@@ -122,76 +127,22 @@ impl BraavosAccumulator {
         result
     }
 
-    // Compute Bezout coefficients (b1, c1) such that:
-    //   a * b1 + b * c1 ≡ 1 (mod sk)
-    fn bezout_coeffs(&self, a: U256, b: U256) -> Result<(U256, U256), &'static str> {
-        // Initialize coefficients
-        let mut old_s = U256::ONE;
-        let mut s = U256::ZERO;
-        let mut old_t = U256::ZERO;
-        let mut t = U256::ONE;
-        let mut r = a % self.sk;
-        let mut old_r = b % self.sk;
-        
-        while r != U256::ZERO {
-            let quotient = old_r / r;
-            let temp = r;
-            r = old_r - quotient * r;
-            old_r = temp;
-            
-            let temp_s = s;
-            s = old_s.wrapping_sub(&quotient.wrapping_mul(&s));
-            old_s = temp_s;
-            
-            let temp_t = t;
-            t = old_t.wrapping_sub(&quotient.wrapping_mul(&t));
-            old_t = temp_t;
-        }
-        
-        // Make coefficients positive modulo sk
-        while old_s < U256::ZERO {
-            old_s = old_s.wrapping_add(&self.sk);
-        }
-        while old_t < U256::ZERO {
-            old_t = old_t.wrapping_add(&self.sk);
-        }
-        
-        // Reduce coefficients modulo sk
-        old_s = old_s % self.sk;
-        old_t = old_t % self.sk;
-        
-        // Verify Bezout identity modulo sk
-        let check = (a.wrapping_mul(&old_s).wrapping_add(&b.wrapping_mul(&old_t))) % self.sk;
-        
-        if check != U256::ONE {
-            return Err("Bezout coefficients verification failed");
-        }
-        
-        Ok((old_s, old_t))
-    }
-    
     fn update_witness_on_deletion(&mut self, x: &[u8], w: U512, y: &[u8]) -> Result<U512, &'static str> {
         let elem_x = self.get_or_generate_element(x);
         let elem_y = self.get_or_generate_element(y);
+        let n = *self.n.as_ref();
+        let p_prime_q_prime = self.sk; // This is p'q' = (p-1)/2 * (q-1)/2
         
-        // Convert to Montgomery form
+        // Convert to Montgomery form for calculations
         let w_monty = MontyForm::new(&w, self.monty_params);
+        let a_monty = self.a;
         
-        // Compute y^(-1) mod sk
-        let y_inv = if elem_y.inv_mod(&self.sk).is_some().into() {
-            elem_y.inv_mod(&self.sk).unwrap()
-        } else {
-            return Err("Element y is not invertible modulo sk");
-        };
-        
-        // Convert y_inv to U512
-        let y_inv_512 = pad_u256_to_u512(y_inv);
-        
-        // Compute w^(y^(-1)) mod n
-        let updated_witness = self.mont_mod_exp(w_monty, &y_inv_512);
-        
-        // Convert back to normal form
-        let result = updated_witness.retrieve() % *self.n.as_ref();
+        // Find y^(-1) mod p'q'
+        let y_inv = elem_y.inv_mod(&p_prime_q_prime);
+        if !bool::from(y_inv.is_some()) {
+            return Err("y is not invertible modulo p'q'");
+        }
+        let y_inv = y_inv.unwrap();
         
         // Debug output
         println!("Witness update verification:");
@@ -199,8 +150,30 @@ impl BraavosAccumulator {
         println!("Current accumulator = {:?}", self.a.retrieve());
         println!("Element x = {:?}", elem_x);
         println!("Element y = {:?}", elem_y);
-        println!("y_inv = {:?}", y_inv);
+        println!("y^(-1) mod p'q' = {:?}", y_inv);
+        
+        // Calculate w^(1/y) mod n
+        // This is equivalent to w^(y^(-1) mod p'q') mod n
+        let y_inv_512 = pad_u256_to_u512(y_inv);
+        let result = self.mont_mod_exp(w_monty, &y_inv_512);
+        let result = result.retrieve() % n;
+        
         println!("Final result = {:?}", result);
+        
+        // Verify that result^y = w mod n
+        let result_monty = MontyForm::new(&result, self.monty_params);
+        let y_512 = pad_u256_to_u512(elem_y);
+        let result_y = self.mont_mod_exp(result_monty, &y_512);
+        println!("Verification that result^y = w:");
+        println!("result^y = {:?}", result_y.retrieve());
+        println!("w = {:?}", w);
+        
+        // Verify that result^x = a mod n
+        let x_512 = pad_u256_to_u512(elem_x);
+        let result_x = self.mont_mod_exp(result_monty, &x_512);
+        println!("Verification that result^x = a:");
+        println!("result^x = {:?}", result_x.retrieve());
+        println!("a = {:?}", self.a.retrieve());
         
         Ok(result)
     }
@@ -218,6 +191,8 @@ fn main() {
     let mut acc = BraavosAccumulator::new(64).expect("Failed to create accumulator");
     println!("Accumulator initialized successfully!");
 
+    // Test case 1: Basic add, delete, verify
+    println!("\n=== Test Case 1: Basic Operations ===");
     let x = b"element_x";
     let y = b"element_y";
 
@@ -251,49 +226,111 @@ fn main() {
     assert!(acc.verify(x, updated_witness), "Verification for x failed");
     println!("Element x verified successfully!");
 
+    // Test case 2: Multiple elements
+    println!("\n=== Test Case 2: Multiple Elements ===");
     let z = b"element_z";
-
-    println!("Adding element z...");
-    let w_z = acc.add(z).expect("Failed to add element z");
-    println!("Witness for z: {:?}", w_z);
-    println!("Accumulator after adding z: {:?}", acc.a.retrieve());
-
     let d = b"element_d";
+    let e = b"element_e";
 
-    println!("Adding element d...");
-    acc.add(d).expect("Failed to add element d");
-    println!("Accumulator after adding d: {:?}", acc.a.retrieve());
-    println!("Element d added successfully!");
+    println!("Adding elements z, d, and e...");
+    let w_z = acc.add(z).expect("Failed to add element z");
+    let w_d = acc.add(d).expect("Failed to add element d");
+    let w_e = acc.add(e).expect("Failed to add element e");
+    println!("Accumulator after adding z, d, and e: {:?}", acc.a.retrieve());
 
+    println!("Verifying all elements...");
+    assert!(acc.verify(x, updated_witness), "Verification for x failed");
+    assert!(acc.verify(z, w_z), "Verification for z failed");
+    assert!(acc.verify(d, w_d), "Verification for d failed");
+    assert!(acc.verify(e, w_e), "Verification for e failed");
+    println!("All elements verified successfully!");
+
+    // Test case 3: Delete middle element
+    println!("\n=== Test Case 3: Delete Middle Element ===");
     println!("Deleting element d...");
     acc.delete(d).expect("Failed to delete element d");
     println!("Accumulator after deleting d: {:?}", acc.a.retrieve());
     println!("Element d deleted successfully!");
 
-    println!("Updating witness for x...");
+    println!("Updating witnesses for remaining elements...");
     updated_witness = acc.update_witness_on_deletion(x, updated_witness, d)
-        .expect("Failed to update witness");
-    println!("Updated witness: {:?}", updated_witness); 
+        .expect("Failed to update witness for x");
+    let updated_w_z = acc.update_witness_on_deletion(z, w_z, d)
+        .expect("Failed to update witness for z");
+    let updated_w_e = acc.update_witness_on_deletion(e, w_e, d)
+        .expect("Failed to update witness for e");
 
-    println!("Verifying element x with updated witness...");
+    println!("Verifying remaining elements...");
     assert!(acc.verify(x, updated_witness), "Verification for x failed");
-    println!("Element x verified successfully!");
+    assert!(acc.verify(z, updated_w_z), "Verification for z failed");
+    assert!(acc.verify(e, updated_w_e), "Verification for e failed");
+    println!("All remaining elements verified successfully!");
 
+    // Test case 4: Delete multiple elements
+    println!("\n=== Test Case 4: Delete Multiple Elements ===");
     println!("Deleting element z...");
     acc.delete(z).expect("Failed to delete element z");
     println!("Accumulator after deleting z: {:?}", acc.a.retrieve());
     println!("Element z deleted successfully!");
 
-    println!("Updating witness for x...");
+    println!("Updating witnesses for remaining elements...");
     updated_witness = acc.update_witness_on_deletion(x, updated_witness, z)
-        .expect("Failed to update witness");
-    println!("Updated witness: {:?}", updated_witness);
+        .expect("Failed to update witness for x");
+    let updated_w_e = acc.update_witness_on_deletion(e, updated_w_e, z)
+        .expect("Failed to update witness for e");
 
-    println!("Verifying element x with updated witness...");
+    println!("Deleting element e...");
+    acc.delete(e).expect("Failed to delete element e");
+    println!("Accumulator after deleting e: {:?}", acc.a.retrieve());
+    println!("Element e deleted successfully!");
+
+    println!("Updating witness for x...");
+    updated_witness = acc.update_witness_on_deletion(x, updated_witness, e)
+        .expect("Failed to update witness for x");
+
+    println!("Verifying element x...");
     assert!(acc.verify(x, updated_witness), "Verification for x failed");
     println!("Element x verified successfully!");
 
+    // Test case 5: Add elements after deletion
+    println!("\n=== Test Case 5: Add Elements After Deletion ===");
+    let f = b"element_f";
+    let g = b"element_g";
 
+    println!("Adding elements f and g...");
+    let w_f = acc.add(f).expect("Failed to add element f");
+    let w_g = acc.add(g).expect("Failed to add element g");
+    println!("Accumulator after adding f and g: {:?}", acc.a.retrieve());
 
-    println!("All operations completed successfully!");
+    println!("Verifying all elements...");
+    assert!(acc.verify(x, updated_witness), "Verification for x failed");
+    assert!(acc.verify(f, w_f), "Verification for f failed");
+    assert!(acc.verify(g, w_g), "Verification for g failed");
+    println!("All elements verified successfully!");
+
+    // Test case 6: Delete and re-add same element
+    println!("\n=== Test Case 6: Delete and Re-add Same Element ===");
+    println!("Deleting element f...");
+    acc.delete(f).expect("Failed to delete element f");
+    println!("Accumulator after deleting f: {:?}", acc.a.retrieve());
+    println!("Element f deleted successfully!");
+
+    println!("Updating witnesses for remaining elements...");
+    updated_witness = acc.update_witness_on_deletion(x, updated_witness, f)
+        .expect("Failed to update witness for x");
+    let updated_w_g = acc.update_witness_on_deletion(g, w_g, f)
+        .expect("Failed to update witness for g");
+
+    println!("Re-adding element f...");
+    let w_f_new = acc.add(f).expect("Failed to re-add element f");
+    println!("Accumulator after re-adding f: {:?}", acc.a.retrieve());
+    println!("Element f re-added successfully!");
+
+    println!("Verifying all elements...");
+    assert!(acc.verify(x, updated_witness), "Verification for x failed");
+    assert!(acc.verify(f, w_f_new), "Verification for f failed");
+    assert!(acc.verify(g, updated_w_g), "Verification for g failed");
+    println!("All elements verified successfully!");
+
+    println!("\nAll test cases completed successfully!");
 }
