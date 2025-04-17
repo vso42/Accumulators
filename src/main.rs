@@ -1,8 +1,8 @@
 use crypto_bigint::{
     modular::{MontyForm, MontyParams},
-    U256, U512, Odd, NonZero, CheckedMul, RandomMod, Invert, CheckedAdd, CheckedDiv, CheckedSub,
+    U256, U512, Odd, NonZero, CheckedMul, CheckedAdd, RandomMod, Encoding,
 };
-use crypto_primes::{generate_safe_prime, is_safe_prime};
+use crypto_primes::{generate_safe_prime, is_safe_prime, is_prime};
 use rand::rngs::OsRng;
 use std::collections::HashMap;
 
@@ -25,6 +25,25 @@ impl BraavosAccumulator {
         assert!(is_safe_prime(&p));
         assert!(is_safe_prime(&q));
 
+        // Calculate p' and q' where p = 2p' + 1 and q = 2q' + 1
+        let divisor = NonZero::new(U256::from(2u32)).unwrap();
+        let p_prime = (p - U256::ONE).wrapping_div(&divisor);
+        let q_prime = (q - U256::ONE).wrapping_div(&divisor);
+
+        // Verify that p' and q' are also prime
+        if !is_prime(&p_prime) || !is_prime(&q_prime) {
+            return Err("Generated safe primes have non-prime p' and q'");
+        }
+
+        // Additional verification: ensure p' and q' are actually the Sophie Germain primes
+        // that correspond to p and q being safe primes
+        let p_check = p_prime.checked_mul(&U256::from(2u32)).unwrap() + U256::ONE;
+        let q_check = q_prime.checked_mul(&U256::from(2u32)).unwrap() + U256::ONE;
+        
+        if p_check != p || q_check != q {
+            return Err("Generated primes are not proper safe primes");
+        }
+
         // Convert U256 primes to U512 with proper padding
         let p_512 = pad_u256_to_u512(p);
         let q_512 = pad_u256_to_u512(q);
@@ -32,10 +51,6 @@ impl BraavosAccumulator {
         let n = p_512.checked_mul(&q_512).unwrap();
         let n_odd = Odd::new(n).expect("RSA modulus must be odd");
 
-        // Calculate p' and q' where p = 2p' + 1 and q = 2q' + 1
-        let divisor = NonZero::new(U256::from(2u32)).unwrap();
-        let p_prime = (p - U256::ONE).wrapping_div(&divisor);
-        let q_prime = (q - U256::ONE).wrapping_div(&divisor);
         let sk = p_prime.checked_mul(&q_prime).unwrap();
 
         // Initialize Montgomery parameters
@@ -118,12 +133,25 @@ impl BraavosAccumulator {
 
     fn mont_mod_exp(&self, base: MontyForm<8>, exponent: &U512) -> MontyForm<8> {
         let mut result = MontyForm::new(&U512::ONE, self.monty_params);
+        let mut base_power = base;
+        
+        // Process exponent in chunks of 64 bits
         for i in (0..512).rev() {
+            // Square step
             result = result.mul(&result);
+            
+            // Multiply step (if bit is set)
             if (exponent.as_words()[i / 64] >> (i % 64)) & 1 == 1 {
-                result = result.mul(&base);
+                result = result.mul(&base_power);
+            }
+            
+            // Every 64 bits, reduce the intermediate result
+            if i % 64 == 0 {
+                let temp = result.retrieve() % *self.n.as_ref();
+                result = MontyForm::new(&temp, self.monty_params);
             }
         }
+        
         result
     }
 
@@ -131,18 +159,23 @@ impl BraavosAccumulator {
         let elem_x = self.get_or_generate_element(x);
         let elem_y = self.get_or_generate_element(y);
         let n = *self.n.as_ref();
-        let p_prime_q_prime = self.sk; // This is p'q' = (p-1)/2 * (q-1)/2
         
-        // Convert to Montgomery form for calculations
+        // Convert inputs to Montgomery form
         let w_monty = MontyForm::new(&w, self.monty_params);
-        let a_monty = self.a;
         
-        // Find y^(-1) mod p'q'
-        let y_inv = elem_y.inv_mod(&p_prime_q_prime);
+        // Since y is prime, we can compute y^(-1) mod sk
+        let y_inv = elem_y.inv_mod(&self.sk);
         if !bool::from(y_inv.is_some()) {
-            return Err("y is not invertible modulo p'q'");
+            return Err("y is not invertible modulo sk");
         }
         let y_inv = y_inv.unwrap();
+        
+        // Convert to Montgomery form
+        let y_inv_512 = pad_u256_to_u512(y_inv);
+        
+        // Compute w^(1/y) mod n
+        let result = self.mont_mod_exp(w_monty, &y_inv_512);
+        let result = result.retrieve() % n;
         
         // Debug output
         println!("Witness update verification:");
@@ -150,25 +183,11 @@ impl BraavosAccumulator {
         println!("Current accumulator = {:?}", self.a.retrieve());
         println!("Element x = {:?}", elem_x);
         println!("Element y = {:?}", elem_y);
-        println!("y^(-1) mod p'q' = {:?}", y_inv);
-        
-        // Calculate w^(1/y) mod n
-        // This is equivalent to w^(y^(-1) mod p'q') mod n
-        let y_inv_512 = pad_u256_to_u512(y_inv);
-        let result = self.mont_mod_exp(w_monty, &y_inv_512);
-        let result = result.retrieve() % n;
-        
+        println!("y^(-1) mod sk = {:?}", y_inv);
         println!("Final result = {:?}", result);
         
-        // Verify that result^y = w mod n
-        let result_monty = MontyForm::new(&result, self.monty_params);
-        let y_512 = pad_u256_to_u512(elem_y);
-        let result_y = self.mont_mod_exp(result_monty, &y_512);
-        println!("Verification that result^y = w:");
-        println!("result^y = {:?}", result_y.retrieve());
-        println!("w = {:?}", w);
-        
         // Verify that result^x = a mod n
+        let result_monty = MontyForm::new(&result, self.monty_params);
         let x_512 = pad_u256_to_u512(elem_x);
         let result_x = self.mont_mod_exp(result_monty, &x_512);
         println!("Verification that result^x = a:");
