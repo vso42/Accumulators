@@ -1,6 +1,6 @@
 use crypto_bigint::{
     modular::{MontyForm, MontyParams},
-    U256, U512, Odd, NonZero, CheckedMul, CheckedAdd, RandomMod, Encoding,
+    U256, U512, Odd, NonZero, CheckedMul, RandomMod,
 };
 use crypto_primes::{generate_safe_prime, is_safe_prime, is_prime};
 use rand::rngs::OsRng;
@@ -133,7 +133,7 @@ impl BraavosAccumulator {
 
     fn mont_mod_exp(&self, base: MontyForm<8>, exponent: &U512) -> MontyForm<8> {
         let mut result = MontyForm::new(&U512::ONE, self.monty_params);
-        let mut base_power = base;
+        let base_power = base;
         
         // Process exponent in chunks of 64 bits
         for i in (0..512).rev() {
@@ -159,23 +159,18 @@ impl BraavosAccumulator {
         let elem_x = self.get_or_generate_element(x);
         let elem_y = self.get_or_generate_element(y);
         let n = *self.n.as_ref();
+        let p_prime_q_prime = self.sk; // This is p'q' = (p-1)/2 * (q-1)/2
         
-        // Convert inputs to Montgomery form
+        // Convert to Montgomery form for calculations
         let w_monty = MontyForm::new(&w, self.monty_params);
+        let a_monty = self.a;
         
-        // Since y is prime, we can compute y^(-1) mod sk
-        let y_inv = elem_y.inv_mod(&self.sk);
+        // Find y^(-1) mod p'q'
+        let y_inv = elem_y.inv_mod(&p_prime_q_prime);
         if !bool::from(y_inv.is_some()) {
-            return Err("y is not invertible modulo sk");
+            return Err("y is not invertible modulo p'q'");
         }
         let y_inv = y_inv.unwrap();
-        
-        // Convert to Montgomery form
-        let y_inv_512 = pad_u256_to_u512(y_inv);
-        
-        // Compute w^(1/y) mod n
-        let result = self.mont_mod_exp(w_monty, &y_inv_512);
-        let result = result.retrieve() % n;
         
         // Debug output
         println!("Witness update verification:");
@@ -183,11 +178,25 @@ impl BraavosAccumulator {
         println!("Current accumulator = {:?}", self.a.retrieve());
         println!("Element x = {:?}", elem_x);
         println!("Element y = {:?}", elem_y);
-        println!("y^(-1) mod sk = {:?}", y_inv);
+        println!("y^(-1) mod p'q' = {:?}", y_inv);
+        
+        // Calculate w^(1/y) mod n
+        // This is equivalent to w^(y^(-1) mod p'q') mod n
+        let y_inv_512 = pad_u256_to_u512(y_inv);
+        let result = self.mont_mod_exp(w_monty, &y_inv_512);
+        let result = result.retrieve() % n;
+        
         println!("Final result = {:?}", result);
         
-        // Verify that result^x = a mod n
+        // Verify that result^y = w mod n
         let result_monty = MontyForm::new(&result, self.monty_params);
+        let y_512 = pad_u256_to_u512(elem_y);
+        let result_y = self.mont_mod_exp(result_monty, &y_512);
+        println!("Verification that result^y = w:");
+        println!("result^y = {:?}", result_y.retrieve());
+        println!("w = {:?}", w);
+        
+        // Verify that result^x = a mod n
         let x_512 = pad_u256_to_u512(elem_x);
         let result_x = self.mont_mod_exp(result_monty, &x_512);
         println!("Verification that result^x = a:");
@@ -295,7 +304,7 @@ fn main() {
     println!("Updating witnesses for remaining elements...");
     updated_witness = acc.update_witness_on_deletion(x, updated_witness, z)
         .expect("Failed to update witness for x");
-    let updated_w_e = acc.update_witness_on_deletion(e, updated_w_e, z)
+    let updated_w_e = acc.update_witness_on_deletion(e, w_e, z)
         .expect("Failed to update witness for e");
 
     println!("Deleting element e...");
